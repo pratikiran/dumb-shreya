@@ -1,0 +1,166 @@
+name: Auto Version Tag
+
+on:
+  push:
+    branches:
+      - main
+      # Add other branches if needed:
+      # - develop
+      # - release/*
+
+jobs:
+  create-tag:
+    name: Create Version Tag
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+      pull-requests: read
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0  # Fetch all history for tags
+
+      - name: Get merged PR labels
+        id: pr-labels
+        uses: actions/github-script@v7
+        with:
+          script: |
+            // Find the PR that was merged with this push
+            const { data: prs } = await github.rest.pulls.list({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              state: 'closed',
+              sort: 'updated',
+              direction: 'desc',
+              per_page: 10
+            });
+            
+            const mergedPR = prs.find(pr => pr.merge_commit_sha === context.sha);
+            
+            if (!mergedPR) {
+              console.log('ℹ️ No merged PR found for this commit. Skipping tag creation.');
+              console.log('This might be a direct push to the branch.');
+              core.setOutput('should_tag', 'false');
+              return;
+            }
+            
+            console.log(`Found merged PR #${mergedPR.number}: ${mergedPR.title}`);
+            
+            const labels = mergedPR.labels.map(l => l.name.toLowerCase());
+            const versionLabels = ['major', 'minor', 'patch'];
+            const foundLabel = labels.find(label => versionLabels.includes(label));
+            
+            if (!foundLabel) {
+              console.log('⚠️ No version label found on PR. Skipping tag creation.');
+              core.setOutput('should_tag', 'false');
+              return;
+            }
+            
+            core.setOutput('should_tag', 'true');
+            core.setOutput('version_type', foundLabel);
+            core.setOutput('pr_number', mergedPR.number);
+            core.setOutput('pr_title', mergedPR.title);
+
+      - name: Get latest tag
+        id: latest-tag
+        if: steps.pr-labels.outputs.should_tag == 'true'
+        run: |
+          # Get the latest semver tag
+          LATEST_TAG=$(git tag -l 'v*' --sort=-v:refname | head -n 1)
+          
+          if [ -z "$LATEST_TAG" ]; then
+            echo "No existing tags found. Starting from v0.0.0"
+            LATEST_TAG="v0.0.0"
+          fi
+          
+          echo "Latest tag: $LATEST_TAG"
+          echo "latest_tag=$LATEST_TAG" >> $GITHUB_OUTPUT
+
+      - name: Calculate new version
+        id: new-version
+        if: steps.pr-labels.outputs.should_tag == 'true'
+        run: |
+          LATEST_TAG="${{ steps.latest-tag.outputs.latest_tag }}"
+          VERSION_TYPE="${{ steps.pr-labels.outputs.version_type }}"
+          
+          # Remove 'v' prefix and split into parts
+          VERSION=${LATEST_TAG#v}
+          IFS='.' read -r MAJOR MINOR PATCH <<< "$VERSION"
+          
+          # Default to 0 if parsing fails
+          MAJOR=${MAJOR:-0}
+          MINOR=${MINOR:-0}
+          PATCH=${PATCH:-0}
+          
+          case $VERSION_TYPE in
+            major)
+              MAJOR=$((MAJOR + 1))
+              MINOR=0
+              PATCH=0
+              ;;
+            minor)
+              MINOR=$((MINOR + 1))
+              PATCH=0
+              ;;
+            patch)
+              PATCH=$((PATCH + 1))
+              ;;
+          esac
+          
+          NEW_TAG="v${MAJOR}.${MINOR}.${PATCH}"
+          echo "New version: $NEW_TAG"
+          echo "new_tag=$NEW_TAG" >> $GITHUB_OUTPUT
+
+      - name: Create and push tag
+        if: steps.pr-labels.outputs.should_tag == 'true'
+        env:
+          NEW_TAG: ${{ steps.new-version.outputs.new_tag }}
+          PR_NUMBER: ${{ steps.pr-labels.outputs.pr_number }}
+          PR_TITLE: ${{ steps.pr-labels.outputs.pr_title }}
+          LATEST_TAG: ${{ steps.latest-tag.outputs.latest_tag }}
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          
+          git tag -a "$NEW_TAG" -m "Release $NEW_TAG - PR #$PR_NUMBER: $PR_TITLE"
+          git push origin "$NEW_TAG"
+          
+          echo "✅ Created and pushed tag: $NEW_TAG"
+          echo "📦 Version bumped: $LATEST_TAG → $NEW_TAG"
+
+      # - name: Create GitHub Release
+      #   if: steps.pr-labels.outputs.should_tag == 'true'
+      #   uses: actions/github-script@v7
+      #   with:
+      #     script: |
+      #       const newTag = '${{ steps.new-version.outputs.new_tag }}';
+      #       const prNumber = '${{ steps.pr-labels.outputs.pr_number }}';
+      #       const prTitle = '${{ steps.pr-labels.outputs.pr_title }}';
+      #       const latestTag = '${{ steps.latest-tag.outputs.latest_tag }}';
+            
+      #       await github.rest.repos.createRelease({
+      #         owner: context.repo.owner,
+      #         repo: context.repo.repo,
+      #         tag_name: newTag,
+      #         name: `Release ${newTag}`,
+      #         body: `## What's Changed\n\n` +
+      #               `- PR #${prNumber}: ${prTitle}\n\n` +
+      #               `**Full Changelog**: https://github.com/${context.repo.owner}/${context.repo.repo}/compare/${latestTag}...${newTag}`,
+      #         draft: false,
+      #         prerelease: false
+      #       });
+            
+      #       console.log(`✅ Created GitHub release for ${newTag}`);
+
+      - name: Summary
+        if: steps.pr-labels.outputs.should_tag == 'true'
+        run: |
+          echo "## 🏷️ Version Tag Created" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "| Field | Value |" >> $GITHUB_STEP_SUMMARY
+          echo "|-------|-------|" >> $GITHUB_STEP_SUMMARY
+          echo "| New Tag | \`${{ steps.new-version.outputs.new_tag }}\` |" >> $GITHUB_STEP_SUMMARY
+          echo "| Previous Tag | \`${{ steps.latest-tag.outputs.latest_tag }}\` |" >> $GITHUB_STEP_SUMMARY
+          echo "| Version Type | \`${{ steps.pr-labels.outputs.version_type }}\` |" >> $GITHUB_STEP_SUMMARY
+          echo "| PR | #${{ steps.pr-labels.outputs.pr_number }} |" >> $GITHUB_STEP_SUMMARY
